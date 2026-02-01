@@ -6,8 +6,8 @@ secured by real smartphones via **Proof-of-Phone Secure v4.1 (PoP-S4.1)**.
 ✅ This repository contains the **reference node software** (gateway + core modes).  
 ⚠️ This repository does **NOT** define consensus rules or network identity.
 
-Canonical protocol rules, bootstrap anchors and genesis parameters are defined separately
-and are **mandatory**.
+Canonical protocol rules, bootstrap anchors and genesis parameters are defined
+separately and are **mandatory**.
 
 ---
 
@@ -24,21 +24,25 @@ Protocol specification, bootstrap rules and genesis anchors:
 ## Node modes
 
 ### Gateway node (public)
-Gateway nodes provide **public HTTPS access** to the network.
 
-- **Public ports:** 80 / 443
-- Nginx is public and proxies requests to the node API
-- Node API stays **private** on `127.0.0.1:5000` (localhost only)
+Gateway nodes provide **public HTTPS access** to the Phonchain network.
+
+- Public-facing infrastructure
+- **Open ports:** 80 / 443
+- Nginx handles HTTPS and proxies requests
+- Node API remains **PRIVATE** on `127.0.0.1:5000` (localhost only)
 
 ### Core node (private)
-Core nodes are private infrastructure components.
+
+Core nodes are **private infrastructure components**.
 
 - **No public ports**
-- API should remain local-only (`127.0.0.1:5000`)
-- If remote access is required: use **VPN** or strict **firewall whitelist**
-  (trusted gateway IPs only)
+- API must remain local-only (`127.0.0.1:5000`)
+- If remote access is required:
+  - VPN (recommended), or
+  - strict firewall whitelist (trusted gateway IPs only)
 
-> ✅ Important: `127.0.0.1:5000` is **not public**.  
+> ✅ Important: `127.0.0.1:5000` is **NOT public**.  
 > It is reachable **only from the same server**.
 
 ---
@@ -53,11 +57,15 @@ Core nodes are private infrastructure components.
 
 ## Security notes
 
-⚠️ NEVER commit or expose:
+⚠️ **NEVER commit or expose:**
+
 - `.env` files
 - database files (`*.db`, `*.sqlite`, `*-wal`, `*-shm`)
-- wallets / private keys
-- logs / backups
+- wallets or private keys
+- logs or backups
+
+This repository contains **reference software and configuration only**.  
+Each operator is responsible for securing their infrastructure.
 
 ---
 
