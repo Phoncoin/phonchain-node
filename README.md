@@ -4,8 +4,10 @@ Reference **gateway / core node implementation** for the **Phonchain mainnet**,
 secured by real smartphones via **Proof-of-Phone Secure v4.1 (PoP-S4.1)**.
 
 This repository contains the **reference node software** (gateway + core modes).
-The **canonical protocol definitions, bootstrap rules, and mainnet anchors**
-are published separately and are mandatory for network identity.
+
+⚠️ **This repository does NOT define the consensus or network identity.**  
+Canonical protocol rules, bootstrap anchors and genesis parameters are
+defined separately and are mandatory.
 
 ---
 
@@ -19,20 +21,29 @@ Protocol specification, bootstrap rules and genesis anchors:
 
 ---
 
-## Modes
+## Node modes
 
 ### Gateway node (public)
-- Serves public HTTPS endpoints (wallets / explorer clients / public API)
+
+Gateway nodes provide **public access** to the Phonchain network.
+
+- Serves HTTPS endpoints (wallets, explorers, public API)
 - **Open ports:** 80 / 443
-- App API stays **private** on `127.0.0.1:5000` behind Nginx reverse proxy
+- Python/Gunicorn API remains **private** on `127.0.0.1:5000`
+- Nginx acts as a reverse proxy
 
 ### Core node (private)
+
+Core nodes are **private infrastructure components**.
+
 - Not intended to be public-facing
 - **No public ports**
-- API may listen on `127.0.0.1:5000` for local admin / private network usage only
-- If remote access is needed: **VPN or firewall whitelist** (trusted gateway IPs)
+- API may listen on `127.0.0.1:5000` for local admin or internal usage only
+- If remote access is required:
+  - VPN (recommended), or
+  - strict firewall whitelist (trusted gateway IPs only)
 
-> ✅ Important: `127.0.0.1:5000` is **not public**.  
+> ✅ Important: `127.0.0.1:5000` is **never public**.  
 > It is reachable **only from the same server**.
 
 ---
@@ -42,27 +53,43 @@ Protocol specification, bootstrap rules and genesis anchors:
 - Linux (Ubuntu 20.04+ recommended)
 - Python 3.9+
 - Public IPv4 (gateway nodes only)
-- A domain name + TLS (recommended for gateway)
+- Domain name + TLS certificate (recommended for gateways)
 
 ---
 
 ## Network ports
 
 ### Gateway (public)
-- TCP 80 / 443 open to the Internet
+
+- TCP ports **80 / 443** open to the Internet
 - Python/Gunicorn binds to **127.0.0.1:5000** only
 
 ### Core (private)
+
 - No Internet-facing ports
-- If you *must* allow remote API access, do it via:
-  - VPN (recommended), or
-  - strict firewall whitelist (trusted gateway IPs only)
+- Optional remote access via:
+  - VPN (recommended)
+  - or firewall whitelist (trusted gateway IPs only)
 
 ---
 
-## Quick start (Gateway)
+## Security notes
 
-### 1) System dependencies
-```bash
-sudo apt update
-sudo apt install -y python3 python3-venv python3-pip nginx
+⚠️ **NEVER commit or expose:**
+
+- `.env` files
+- Database files (`*.db`, `*.sqlite`)
+- Wallets or private keys
+- Logs or backups
+
+This repository contains **reference software and configuration only**.
+Each operator is responsible for securing their infrastructure.
+
+---
+
+## Support & disclosure
+
+For documentation and protocol rules, see the canonical repository:
+👉 https://github.com/Phoncoin/phoncoin
+
+For security issues, follow responsible disclosure procedures.
