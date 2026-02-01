@@ -1,3 +1,0 @@
-sudo useradd -r -s /bin/false phonchain
-sudo mkdir -p /opt/phonchain-node
-sudo chown -R phonchain:phonchain /opt/phonchain-node
