@@ -1,21 +1,32 @@
+# Secrets / env
+.env
+*.env
+
 # Python
 __pycache__/
 *.py[cod]
-
-# Virtual environment
+*.pyo
+*.pyd
 .venv/
 venv/
+.envrc
 
-# Environment variables
-.env
-
-# Logs
+# Runtime / data
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
 *.log
 
-# OS / editor
-.DS_Store
-.vscode/
-.idea/
+# Wallets / keys (never commit)
+wallet*.json
+wallet_secure*.json
+*.key
+*.pem
 
-# Gunicorn
-gunicorn.pid
+# Archives / backups
+*.tar.gz
+*.zip
+*.bak
+*_backup_*
