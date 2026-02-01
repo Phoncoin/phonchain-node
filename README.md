@@ -19,10 +19,20 @@ Protocol specification, bootstrap rules and genesis anchors are defined here:
 ---
 
 ## Requirements
+
 - Linux (Ubuntu 20.04+ recommended)
 - Python 3.9+
 - Public IPv4 (for gateway nodes)
-- Open ports: `80 / 443 / 5000`
+
+### Network ports
+
+Gateway mode (public):
+- Open ports: 80 / 443
+- Internal API runs on 127.0.0.1:5000 behind Nginx reverse proxy
+
+Core mode (private):
+- No public ports
+- API port (5000) must be accessible only from trusted gateway IPs (firewall whitelist) or VPN
 
 ---
 
