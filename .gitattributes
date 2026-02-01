@@ -1,0 +1,4 @@
+genesis.txt text eol=crlf
+GENESIS_PROOF.md text eol=lf
+creator_pubkey.pem text eol=lf
+genesis.sig binary
