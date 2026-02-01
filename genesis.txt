@@ -1,0 +1,28 @@
+PHONCHAIN — GENESIS STATEMENT
+
+Chain name: Phonchain
+Ticker: PHC
+Consensus: Proof-of-Phone (PoP Secure v4.1)
+
+Genesis block canonical hash:
+c098fa5e985edd56634af262975b771f0dadc607494d6875cb725f1006611658
+
+Genesis timestamp (UTC):
+2025-10-09 08:53:20
+
+Declaration:
+This genesis block is declared as the immutable origin
+of the Phonchain network.
+
+The Proof-of-Phone consensus anchors security
+to real human-operated phones.
+
+No premine.
+No hidden keys.
+No privileged access.
+
+After this signature, no founder, creator,
+or authority retains any special role
+over the protocol or the network.
+
+Signed offline.
