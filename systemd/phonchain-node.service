@@ -1,0 +1,21 @@
+[Unit]
+Description=Phonchain Node (PoP-S4.1) - Flask/Gunicorn
+After=network.target
+
+[Service]
+Type=simple
+User=phonchain
+WorkingDirectory=/opt/phonchain-node
+
+EnvironmentFile=/opt/phonchain-node/.env
+
+ExecStart=/opt/phonchain-node/.venv/bin/gunicorn \
+  --workers 2 \
+  --bind 127.0.0.1:5000 \
+  app:app
+
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
