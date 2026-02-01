@@ -72,6 +72,92 @@ Each operator is responsible for securing their infrastructure.
 ## Gateway installation (recommended public setup)
 
 ### 1) System dependencies
-```bash
+
+~~~bash
 sudo apt update
 sudo apt install -y python3 python3-venv python3-pip nginx
+~~~
+
+### 2) Create system user and install directory
+
+Create a dedicated unprivileged system user and installation directory:
+
+~~~bash
+sudo useradd -r -s /bin/false phonchain
+sudo mkdir -p /opt/phonchain-node
+sudo chown -R phonchain:phonchain /opt/phonchain-node
+~~~
+
+### 3) Install node software
+
+Clone the repository:
+
+~~~bash
+git clone https://github.com/Phoncoin/phonchain-node.git
+cd phonchain-node
+~~~
+
+Copy required files into the installation directory:
+
+~~~bash
+sudo cp app.py requirements.txt /opt/phonchain-node/
+sudo cp config/example.env /opt/phonchain-node/.env
+sudo chown -R phonchain:phonchain /opt/phonchain-node
+~~~
+
+Create a virtual environment and install Python dependencies:
+
+~~~bash
+sudo -u phonchain python3 -m venv /opt/phonchain-node/.venv
+sudo -u phonchain /opt/phonchain-node/.venv/bin/pip install -r /opt/phonchain-node/requirements.txt
+~~~
+
+### 4) Nginx reverse proxy (gateway only)
+
+Install the provided Nginx configuration:
+
+~~~bash
+sudo cp nginx/phonchain-node.conf /etc/nginx/sites-available/phonchain-node
+sudo ln -s /etc/nginx/sites-available/phonchain-node /etc/nginx/sites-enabled/phonchain-node
+sudo nginx -t && sudo systemctl reload nginx
+~~~
+
+ℹ️ TLS (HTTPS) should be configured separately (e.g. Certbot / Let’s Encrypt).
+
+### 5) systemd service
+
+Install and enable the systemd service:
+
+~~~bash
+sudo cp systemd/phonchain-node.service /etc/systemd/system/phonchain-node.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now phonchain-node.service
+~~~
+
+Check service status:
+
+~~~bash
+sudo systemctl status phonchain-node.service --no-pager
+~~~
+
+---
+
+## Core node installation (private)
+
+For core nodes:
+
+- Skip the Nginx step
+- Do NOT open ports 80 / 443
+- Keep API bound to `127.0.0.1:5000`
+- Access only via local admin, VPN, or firewall whitelist (trusted gateway IPs)
+
+---
+
+## Final notes
+
+- This repository provides reference implementation only
+- Network identity is enforced by the canonical repository
+- Operators may run nodes but cannot redefine Phonchain
+
+For protocol rules and consensus:
+👉 https://github.com/Phoncoin/phoncoin
