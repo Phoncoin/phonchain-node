@@ -8,7 +8,7 @@ Only the **latest release** of the reference node is supported.
 
 Please report security issues **privately**.
 
-📧 Email: security@phoncoin.org
+📧 Email: contact@phoncoin.org
 
 Do NOT open public issues for:
 - private key exposure
