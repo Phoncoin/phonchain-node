@@ -813,7 +813,7 @@ class Node:
         is_rooted = bool(info.get("is_rooted", False))
 
         # ✅ score OU trust_score (whitepaper)
-        score = int(info.get("score", info.get("trust_score", 50)))
+        score = int(info.get("score", info.get("trust_score", 0)))
         score = max(0, min(score, 100))
 
         # ✅ Play Integrity — bool legacy
