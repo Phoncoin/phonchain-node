@@ -10,7 +10,6 @@ import threading
 from dataclasses import dataclass
 from typing import List, Optional, Dict, Any, Tuple
 
-from pathlib import Path
 from flask import Flask, request, jsonify, render_template_string, redirect, url_for
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
@@ -18,15 +17,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 # GLOBAL CONFIG
 # -------------------------------------------------------------------
 
-# Data directory: keep runtime state out of the repo and avoid permission issues.
-# - Default: <repo>/data (works for local dev).
-# - In production: set PHONCHAIN_DATA_DIR=/var/lib/phonchain-node (recommended).
-BASE_DIR = Path(__file__).resolve().parent
-DATA_DIR = Path(os.environ.get("PHONCHAIN_DATA_DIR", str(BASE_DIR / "data")))
-DATA_DIR.mkdir(parents=True, exist_ok=True)
-# Database path (SQLite). If POAM_DB is relative, it is resolved inside DATA_DIR.
-_poam_db = os.environ.get("POAM_DB", "poam_node.db")
-DB_PATH = str((DATA_DIR / _poam_db) if not os.path.isabs(_poam_db) else Path(_poam_db))
+DB_PATH = os.environ.get("POAM_DB", "poam_node.db")
 
 CHAIN_NAME = "Phonchain"
 TICKER = "PHC"
@@ -70,7 +61,7 @@ MAX_BLOCK_HB = int(os.environ.get("MAX_BLOCK_HB", "30000"))  # node default
 
 # TX aggregation
 MIN_BLOCK_TX = int(os.environ.get("MIN_BLOCK_TX", "0"))         # 0 = blocs HB-only OK
-TX_THRESHOLD = int(os.environ.get("TX_THRESHOLD", "200"))         # seuil indicatif (UI/metrics), ne force PAS la création de bloc
+TX_THRESHOLD = int(os.environ.get("TX_THRESHOLD", "200"))         # Comment standardized to Englishation de bloc
 MAX_BLOCK_TX = int(os.environ.get("MAX_BLOCK_TX", "20000"))
 
 # Heartbeat rate limiting
@@ -104,6 +95,17 @@ MIN_DEVICE_SCORE = int(os.environ.get("MIN_DEVICE_SCORE", "30"))
 
 # Optional stricter binding (0/1)
 STRICT_DEVICE_BINDING = int(os.environ.get("STRICT_DEVICE_BINDING", "0"))
+
+# Emulator/Sybil guard toggles (runtime; does NOT change block format)
+EMU_GUARD_ENABLED = int(os.environ.get("EMU_GUARD_ENABLED", "0"))  # 1=reject emulator-like fingerprints
+
+# Persistent fingerprint->pubkey binding (runtime; DB-backed; does NOT change block format)
+# - mode=cooldown: allow rebind after REBIND_COOLDOWN_SEC (default 7 days)
+# - mode=strict: never allow rebind (NOT recommended for UX)
+PERSIST_BINDING_ENABLED = int(os.environ.get("PERSIST_BINDING_ENABLED", "0"))
+BINDING_MODE = str(os.environ.get("BINDING_MODE", "cooldown")).lower().strip()  # cooldown|strict
+REBIND_COOLDOWN_SEC = int(os.environ.get("REBIND_COOLDOWN_SEC", str(7 * 24 * 3600)))
+
 
 # Explorer metrics options
 ACTIVE_MINERS_WINDOW_SEC = int(os.environ.get("ACTIVE_MINERS_WINDOW_SEC", "600"))  # 10 minutes
@@ -268,7 +270,7 @@ class PersistDB:
             """
         )
 
-        # legacy table (tu l’avais déjà). On la garde.
+        # Comment standardized to English). We keep it for compatibility.
         c.execute(
             """
             CREATE TABLE IF NOT EXISTS transactions (
@@ -300,6 +302,21 @@ class PersistDB:
 
         c.execute("CREATE INDEX IF NOT EXISTS idx_txs_block ON txs(block_idx);")
         c.execute("CREATE INDEX IF NOT EXISTS idx_txs_from_to ON txs(from_pubkey, to_pubkey);")
+
+
+        # Persistent device fingerprint bindings (anti-sybil, restart-safe; hors-consensus)
+        c.execute(
+            """
+            CREATE TABLE IF NOT EXISTS device_bindings (
+                device_fingerprint TEXT PRIMARY KEY,
+                pubkey TEXT NOT NULL,
+                first_seen_ts INTEGER,
+                last_seen_ts INTEGER,
+                last_rebind_ts INTEGER
+            );
+            """
+        )
+        c.execute("CREATE INDEX IF NOT EXISTS idx_device_bindings_pubkey ON device_bindings(pubkey);")
 
         # meta table (hors-consensus) pour metrics explorer
         c.execute(
@@ -497,8 +514,63 @@ class PersistDB:
         rows = c.execute("SELECT * FROM balances;").fetchall()
         return {r["pubkey"]: int(r["balance_raw"]) for r in rows}
 
-    # legacy (garde)
+    # ---------------------------------------------------------------
+    # Persistent device fingerprint bindings (anti-sybil; hors-consensus)
+    # ---------------------------------------------------------------
+    def load_device_bindings(self) -> Dict[str, Dict[str, Any]]:
+        c = self.conn.cursor()
+        try:
+            rows = c.execute("SELECT * FROM device_bindings;").fetchall()
+        except Exception:
+            return {}
+        out: Dict[str, Dict[str, Any]] = {}
+        for r in rows:
+            out[str(r["device_fingerprint"])] = {
+                "pubkey": str(r["pubkey"]),
+                "first_seen_ts": int(r["first_seen_ts"]) if r["first_seen_ts"] is not None else 0,
+                "last_seen_ts": int(r["last_seen_ts"]) if r["last_seen_ts"] is not None else 0,
+                "last_rebind_ts": int(r["last_rebind_ts"]) if r["last_rebind_ts"] is not None else 0,
+            }
+        return out
+
+    def upsert_device_binding(
+        self,
+        device_fingerprint: str,
+        pubkey: str,
+        now_ts: int,
+        is_rebind: bool = False,
+    ) -> None:
+        device_fingerprint = (device_fingerprint or "").strip()
+        pubkey = (pubkey or "").strip()
+        if not device_fingerprint or not pubkey:
+            return
+
+        c = self.conn.cursor()
+        existing = c.execute(
+            "SELECT first_seen_ts, last_rebind_ts FROM device_bindings WHERE device_fingerprint = ?;",
+            (device_fingerprint,),
+        ).fetchone()
+
+        first_seen = int(existing["first_seen_ts"]) if existing and existing["first_seen_ts"] is not None else int(now_ts)
+        last_rebind_prev = int(existing["last_rebind_ts"]) if existing and existing["last_rebind_ts"] is not None else 0
+        last_rebind_new = int(now_ts) if is_rebind else last_rebind_prev
+
+        c.execute(
+            """
+            INSERT OR REPLACE INTO device_bindings(
+                device_fingerprint, pubkey, first_seen_ts, last_seen_ts, last_rebind_ts
+            )
+            VALUES (?, ?, ?, ?, ?);
+            """,
+            (device_fingerprint, pubkey, int(first_seen), int(now_ts), int(last_rebind_new)),
+        )
+        self.conn.commit()
+
+    # ---------------------------------------------------------------
+    # Transactions (legacy + on-chain helpers)
+    # ---------------------------------------------------------------
     def save_transaction_legacy(self, tx: Transaction) -> None:
+        """Legacy mempool log (kept for compatibility)."""
         c = self.conn.cursor()
         c.execute(
             """
@@ -532,7 +604,7 @@ class PersistDB:
             "SELECT * FROM txs ORDER BY block_idx DESC, idx_in_block DESC LIMIT ?;",
             (limit,),
         ).fetchall()
-        out = []
+        out: List[Dict[str, Any]] = []
         for r in rows:
             out.append(
                 {
@@ -546,7 +618,6 @@ class PersistDB:
             )
         return out
 
-    # --- Explorer helpers (read-only) ---
     def txs_count(self) -> int:
         c = self.conn.cursor()
         r = c.execute("SELECT COUNT(1) AS n FROM txs;").fetchone()
@@ -564,7 +635,7 @@ class PersistDB:
             "SELECT * FROM txs ORDER BY block_idx DESC, idx_in_block DESC LIMIT ? OFFSET ?;",
             (limit, offset),
         ).fetchall()
-        out = []
+        out: List[Dict[str, Any]] = []
         for r in rows:
             out.append(
                 {
@@ -579,8 +650,8 @@ class PersistDB:
             )
         return out
 
-    # ✅ recent txs filtered for one address (metamask-like)
     def load_recent_txs_for_address(self, address: str, limit: int = 50) -> List[Dict[str, Any]]:
+        """Recent on-chain txs filtered for one address."""
         limit = max(1, min(int(limit), 500))
         c = self.conn.cursor()
         rows = c.execute(
@@ -592,7 +663,7 @@ class PersistDB:
             """,
             (address, address, limit),
         ).fetchall()
-        out = []
+        out: List[Dict[str, Any]] = []
         for r in rows:
             out.append(
                 {
@@ -605,6 +676,7 @@ class PersistDB:
                 }
             )
         return out
+
 
 # -------------------------------------------------------------------
 # NODE (PoP Secure v4.1)
@@ -657,6 +729,27 @@ class Node:
         self.device_last_seen: Dict[str, int] = {}
         self.device_bindings: Dict[str, str] = {}
 
+        # Persistent binding meta (restart-safe anti-sybil; hors-consensus)
+        self.device_bindings_meta: Dict[str, Dict[str, Any]] = {}
+
+        if PERSIST_BINDING_ENABLED == 1:
+            try:
+                loaded = self.db.load_device_bindings()
+                for fp, meta in loaded.items():
+                    pk = str(meta.get("pubkey") or "").strip()
+                    if not fp or not pk:
+                        continue
+                    self.device_bindings[fp] = pk
+                    self.device_bindings_meta[fp] = {
+                        "pubkey": pk,
+                        "first_seen_ts": int(meta.get("first_seen_ts") or 0),
+                        "last_seen_ts": int(meta.get("last_seen_ts") or 0),
+                        "last_rebind_ts": int(meta.get("last_rebind_ts") or 0),
+                    }
+            except Exception:
+                # Never crash startup for a non-consensus feature
+                self.device_bindings_meta = {}
+
         # TX sender rate-limit tracking
         self.tx_last_seen: Dict[str, int] = {}
 
@@ -669,6 +762,7 @@ class Node:
         self._stop_flag = False
         self._scheduler_thread = threading.Thread(target=self._block_scheduler_loop, daemon=True)
         self._scheduler_thread.start()
+
 
     def effective_difficulty_zeros(self, now: int) -> int:
         """Return required PoW zeros.
@@ -802,25 +896,64 @@ class Node:
             reward = max(TOTAL_SUPPLY_CAP_RAW - self.total_issued_raw, 0)
 
         return max(int(reward), 0)
+    # ------------------ DEVICE CHECK (PoP Secure v4.1 FINAL) ------------------
 
+    def _server_emulator_heuristic(self, info: Dict[str, Any]) -> Tuple[bool, str]:
+        """Best-effort emulator detection on server side.
 
-        # ------------------ DEVICE CHECK (PoP Secure v4.1 FINAL) ------------------
+        Not consensus-critical; only gates HB admission.
+        Keep behind EMU_GUARD_ENABLED to avoid accidental disruption.
+        """
+        if not isinstance(info, dict):
+            return False, ""
+
+        fields: List[str] = []
+        for k in ("manufacturer", "brand", "model", "device", "hardware", "product", "board", "bootloader", "fingerprint"):
+            v = info.get(k)
+            if v is None:
+                continue
+            try:
+                fields.append(str(v).lower())
+            except Exception:
+                pass
+
+        blob = " | ".join(fields)
+
+        patterns = [
+            "bluestacks", "bstack", "nox", "ldplayer", "memu", "genymotion",
+            "vbox", "virtualbox", "goldfish", "ranchu", "emulator", "sdk_gphone",
+            "android sdk built for x86", "qemu", "ttvm", "andy", "droid4x",
+        ]
+        for p in patterns:
+            if p in blob:
+                return True, f"match:{p}"
+
+        if ("sdk" in blob and ("goldfish" in blob or "ranchu" in blob)):
+            return True, "combo:sdk+goldfish/ranchu"
+
+        return False, ""
 
     def eval_device_info(self, hb: Heartbeat) -> Dict[str, Any]:
         info = hb.device_info or {}
 
         is_emulator = bool(info.get("is_emulator", False))
+
+        # Server-side heuristic (prevents trivial client spoofing of is_emulator)
+        server_emulator, server_emulator_reason = self._server_emulator_heuristic(info)
+        if EMU_GUARD_ENABLED == 1 and server_emulator:
+            return {"ok": False, "reason": "emulator_heuristic", "score": 0, "detail": server_emulator_reason}
+
         is_rooted = bool(info.get("is_rooted", False))
 
-        # ✅ score OU trust_score (whitepaper)
-        score = int(info.get("score", info.get("trust_score", 0)))
+        # score OR trust_score (whitepaper)
+        score = int(info.get("score", info.get("trust_score", 50)))
         score = max(0, min(score, 100))
 
-        # ✅ Play Integrity — bool legacy
+        # Play Integrity — bool legacy
         pi_basic = bool(info.get("play_integrity_basic", False))
         pi_device = bool(info.get("play_integrity_device", False))
 
-        # ✅ Play Integrity — string whitepaper
+        # Play Integrity — string whitepaper
         pi_str = str(info.get("play_integrity", "unknown")).lower()
         if pi_str in ("ok", "device", "strong"):
             pi_device = True
@@ -832,21 +965,21 @@ class Node:
 
         google_play_certified = bool(info.get("google_play_certified", False))
 
-        # ❌ Emulator = rejet immédiat
+        # Emulator = immediate reject (even if EMU_GUARD_ENABLED is off, client flag is a strong signal)
         if is_emulator:
             return {"ok": False, "reason": "emulator", "score": 0}
 
-        # ❌ Root + score nul
+        # Root + score nul
         if is_rooted and score <= 0:
             return {"ok": False, "reason": "rooted_low_score", "score": 0}
 
-        # 🎖️ Bonus integrity
+        # Bonus integrity
         if pi_device:
             score = max(score, 80)
         elif pi_basic:
             score = max(score, 60)
 
-        # ⚠️ Root sans integrity → plafonné
+        # Comment standardized to English
         if is_rooted and not (pi_basic or pi_device):
             score = min(score, 30)
 
@@ -882,7 +1015,6 @@ class Node:
             "latency_note": latency_note,
         }
 
-
     # ------------------ HEARTBEAT ------------------
 
     def verify_heartbeat(self, hb: Heartbeat) -> Tuple[bool, str, Dict[str, Any]]:
@@ -895,6 +1027,8 @@ class Node:
             return False, "heartbeat_too_old", {}
 
         bound_pk = self.device_bindings.get(hb.device_fingerprint)
+
+        # Legacy strict binding (in-memory): never allow two pubkeys on same fingerprint
         if bound_pk is not None and bound_pk != hb.pubkey_hex and STRICT_DEVICE_BINDING == 1:
             return False, "fingerprint_bound_to_other_pubkey", {"bound": bound_pk}
 
@@ -922,11 +1056,69 @@ class Node:
             return False, "rate_limited_device", {"min_seconds": MIN_SECONDS_BETWEEN_HB_PER_DEVICE}
         self.device_last_seen[hb.device_fingerprint] = hb.timestamp
 
-        # bind
+
+        # bind (in-memory) + optional persistent binding (DB)
         if bound_pk is None:
             self.device_bindings[hb.device_fingerprint] = hb.pubkey_hex
+            if PERSIST_BINDING_ENABLED == 1:
+                try:
+                    self.db.upsert_device_binding(hb.device_fingerprint, hb.pubkey_hex, now_ts=now, is_rebind=False)
+                    self.device_bindings_meta[hb.device_fingerprint] = {
+                        "pubkey": hb.pubkey_hex,
+                        "first_seen_ts": now,
+                        "last_seen_ts": now,
+                        "last_rebind_ts": 0,
+                    }
+                except Exception:
+                    pass
         elif bound_pk != hb.pubkey_hex:
+            # If strict device binding is enabled, keep legacy behavior
+            if STRICT_DEVICE_BINDING == 1:
+                return False, "fingerprint_bound_to_other_pubkey", {"bound": bound_pk}
+
+            # Optional persistent binding: allow rebind only under policy
+            if PERSIST_BINDING_ENABLED == 1:
+                meta = self.device_bindings_meta.get(hb.device_fingerprint, {})
+                last_rebind = int(meta.get("last_rebind_ts", 0) or 0)
+                first_seen = int(meta.get("first_seen_ts", 0) or 0)
+                last_rebind_effective = last_rebind if last_rebind > 0 else first_seen
+
+                if BINDING_MODE == "strict":
+                    return False, "fingerprint_bound_persistently", {"bound": bound_pk}
+
+                # cooldown mode
+                if last_rebind_effective > 0 and (now - last_rebind_effective) < REBIND_COOLDOWN_SEC:
+                    return False, "fingerprint_rebind_cooldown", {
+                        "bound": bound_pk,
+                        "cooldown_sec": REBIND_COOLDOWN_SEC,
+                        "retry_in_sec": max(0, REBIND_COOLDOWN_SEC - (now - last_rebind_effective)),
+                    }
+
+                # Allow rebind
+                self.device_bindings[hb.device_fingerprint] = hb.pubkey_hex
+                try:
+                    self.db.upsert_device_binding(hb.device_fingerprint, hb.pubkey_hex, now_ts=now, is_rebind=True)
+                    self.device_bindings_meta[hb.device_fingerprint] = {
+                        "pubkey": hb.pubkey_hex,
+                        "first_seen_ts": int(meta.get("first_seen_ts", now) or now),
+                        "last_seen_ts": now,
+                        "last_rebind_ts": now,
+                    }
+                except Exception:
+                    pass
+
             print("[SECURITY] fingerprint multi-address:", hb.device_fingerprint[:16], "old=", bound_pk[:16], "new=", hb.pubkey_hex[:16])
+        else:
+            # Same binding: refresh last_seen if persistent binding enabled
+            if PERSIST_BINDING_ENABLED == 1:
+                try:
+                    self.db.upsert_device_binding(hb.device_fingerprint, bound_pk, now_ts=now, is_rebind=False)
+                    meta = self.device_bindings_meta.get(hb.device_fingerprint, {"pubkey": bound_pk})
+                    meta["pubkey"] = bound_pk
+                    meta["last_seen_ts"] = now
+                    self.device_bindings_meta[hb.device_fingerprint] = meta
+                except Exception:
+                    pass
 
         # PoW check (CONSENSUS)
         hb_hash = sha256_hex((hb.pubkey_hex + str(hb.timestamp) + hb.nonce + hb.device_fingerprint).encode())
@@ -1068,8 +1260,8 @@ class Node:
                 tx.txid = tx.compute_txid()
 
         # --- IMPORTANT ---
-        # Pendant l'inclusion en bloc, on ne doit PAS vérifier une TX
-        # contre un txpool qui contient déjà les TX du bloc (sinon double-compte du pending).
+        # Comment standardized to Englishrifier une TX
+        # Comment standardized to English les TX du bloc (sinon double-compte du pending).
         # On bascule temporairement le txpool sur rest_tx (mempool restant).
         self.txpool = rest_tx
 
@@ -1212,7 +1404,7 @@ def submit_proof():
     return jsonify({"ok": ok, "reason": reason, "meta": meta})
 
 
-# ✅ MetaMask-like state for one address (total / pending / available + pending txs + confirmed txs)
+# ✅ State for one address (total / pending / available + pending txs + confirmed txs)
 @app.route("/address/<pubkey>/state")
 def address_state(pubkey: str):
     pubkey = (pubkey or "").strip()
@@ -1319,7 +1511,7 @@ def transfer():
 
     ok, reason, meta = node.submit_transaction(tx)
 
-    # ✅ rétrocompatible + wallet-friendly (txid + status)
+    # Comment standardized to Englishtrocompatible + wallet-friendly (txid + status)
     return jsonify(
         {
             "ok": ok,
@@ -1652,7 +1844,7 @@ EXPLORER_BASE_TEMPLATE = """<!doctype html>
     function copyText(txt) {
       if (!txt) return;
       if (navigator.clipboard && navigator.clipboard.writeText) {
-        navigator.clipboard.writeText(txt).then(() => showToast('Copié ✓')).catch(() => fallbackCopy(txt));
+        navigator.clipboard.writeText(txt).then(() => showToast('Copied ✓')).catch(() => fallbackCopy(txt));
       } else {
         fallbackCopy(txt);
       }
@@ -1666,7 +1858,7 @@ EXPLORER_BASE_TEMPLATE = """<!doctype html>
       ta.select();
       try { document.execCommand('copy'); } catch(e) {}
       document.body.removeChild(ta);
-      showToast('Copié ✓');
+      showToast('Copied ✓');
     }
     function showToast(msg) {
       let t = document.getElementById('toast');
@@ -1768,18 +1960,18 @@ def explorer():
             f"<td>{age_s}s</td>"
             "</tr>"
         )
-    pending_rows = ''.join(pending_rows_list) if pending_rows_list else "<tr><td colspan='5' class='muted'>Aucune transaction en attente</td></tr>"
+    pending_rows = ''.join(pending_rows_list) if pending_rows_list else "<tr><td colspan='5' class='muted'>No pending transactions</td></tr>"
 
     content = f"""
     <div class="card">
-      <h2>Réseau</h2>
+      <h2>Network</h2>
       <div class="muted">
         Node: <span class="phc">/network_info</span> ·
         Chain height: <span class="phc">{height}</span>
         · <span class="pill"><a href="/explorer/holders">Top Holders</a></span>
-        · <span class="pill"><a href="/explorer/miners">Top Mineurs</a></span>
-        · <span class="pill"><a href="/explorer/blocks">Tous les blocs</a></span>
-        · <span class="pill"><a href="/explorer/txs">Toutes les TX</a></span>
+        · <span class="pill"><a href="/explorer/miners">Top Miners</a></span>
+        · <span class="pill"><a href="/explorer/blocks">All blocks</a></span>
+        · <span class="pill"><a href="/explorer/txs">All TXs</a></span>
         · <span class="pill">HB mempool: {len(node.mempool)}</span>
         · <span class="pill">TX mempool: {len(node.txpool)}</span>
       </div>
@@ -1790,11 +1982,11 @@ def explorer():
           <div style="font-size:22px; font-weight:700; color:#a7ffdf;">{holders}</div>
         </div>
         <div class="metric-box">
-          <div class="muted">Mineurs actifs (10 min)</div>
+          <div class="muted">Active miners (10 min)</div>
           <div style="font-size:22px; font-weight:700; color:#a7ffdf;">{active_miners}</div>
         </div>
         <div class="metric-box" style="flex:1; min-width:360px;">
-          <div class="muted">Graphe PRO (courbes normalisées) — derniers blocs</div>
+          <div class="muted">PRO chart (normalized curves) — latest blocks</div>
           <div class="chart-wrap"><canvas id="phcChart"></canvas></div>
           <div class="muted" style="margin-top:6px;">Source: <span class="phc">/metrics</span></div>
         </div>
@@ -1802,15 +1994,15 @@ def explorer():
 
       <div class="search-row">
         <form action="{url_for('explorer_search')}" method="get" style="display:flex; gap:8px; flex-wrap:wrap; align-items:center;">
-          <input type="text" name="q" placeholder="Recherche: height / hash / txid / adresse..." />
-          <button type="submit">Chercher</button>
-          <span class="pill">Astuce: clique/tap sur une adresse pour copier</span>
+          <input type="text" name="q" placeholder="Search: height / hash / txid / address..." />
+          <button type="submit">Search</button>
+          <span class="pill">Tip: click/tap an address to copy</span>
         </form>
       </div>
     </div>
 
     <div class="card">
-      <h2>Derniers blocs</h2>
+      <h2>Latest blocks</h2>
       <table>
         <thead>
           <tr>
@@ -1823,42 +2015,42 @@ def explorer():
           </tr>
         </thead>
         <tbody>
-          {''.join(rows) if rows else '<tr><td colspan="6" class="muted">Aucun bloc</td></tr>'}
+          {''.join(rows) if rows else '<tr><td colspan="6" class="muted">No blocks</td></tr>'}
         </tbody>
       </table>
     </div>
 
     <div class="card">
-      <h2>Dernières transactions (on-chain)</h2>
-      <div class="muted">Affiche les TX incluses dans des blocs (table txs).</div>
+      <h2>Latest transactions (on-chain)</h2>
+      <div class="muted">Shows TXs included in blocks (txs table).</div>
       <table>
         <thead>
           <tr>
             <th>TxID</th>
             <th>From</th>
             <th>To</th>
-            <th>Montant</th>
+            <th>Amount</th>
             <th>Timestamp (UTC)</th>
-            <th>Bloc</th>
+            <th>Block</th>
           </tr>
         </thead>
         <tbody>
-          {''.join(tx_rows) if tx_rows else '<tr><td colspan="6" class="muted">Aucune transaction encore</td></tr>'}
+          {''.join(tx_rows) if tx_rows else '<tr><td colspan="6" class="muted">No transactions yet</td></tr>'}
         </tbody>
       </table>
     </div>
 
 
     <div class="card">
-      <h2>Transactions en attente (L2 mempool)</h2>
-      <div class="muted">Acceptées instantanément (L2), finalisées quand elles entrent dans un bloc (L1).</div>
+      <h2>Pending transactions (L2 mempool)</h2>
+      <div class="muted">Accepted instantly (L2), finalized when included in a block (L1).</div>
       <table>
         <thead>
           <tr>
             <th>TxID</th>
             <th>From</th>
             <th>To</th>
-            <th>Montant</th>
+            <th>Amount</th>
             <th>Age</th>
           </tr>
         </thead>
@@ -2053,7 +2245,7 @@ def explorer():
 
           drawLegend([
             {{ label:`HB (max ${'{'}nh.max{'}'})`, color:'#22c55e' }},
-            {{ label:`Mineurs (max ${'{'}nm.max{'}'})`, color:'#00ffaa' }},
+            {{ label:`Miners (max ${'{'}nm.max{'}'})`, color:'#00ffaa' }},
             {{ label:`Diff (max ${'{'}nd.max{'}'})`, color:'#60a5fa' }},
             {{ label:`TX (max ${'{'}nt.max{'}'})`, color:'#f59e0b' }}
           ]);
@@ -2116,11 +2308,11 @@ def explorer_blocks():
 
     content = f"""
     <div class="card">
-      <h2>Blocs (paginated)</h2>
+      <h2>Blocks (paginated)</h2>
       <div class="muted">
         <a href="{url_for('explorer')}">← Dashboard</a>
         &nbsp;·&nbsp;
-        <a href="{latest_link}">Derniers</a>
+        <a href="{latest_link}">Latest</a>
         {'&nbsp;·&nbsp;<a href="'+newer_link+'">Plus récents</a>' if newer_link else ''}
         {'&nbsp;·&nbsp;<a href="'+older_link+'">Plus anciens</a>' if older_link else ''}
       </div>
@@ -2145,7 +2337,7 @@ def explorer_blocks():
           </tr>
         </thead>
         <tbody>
-          {''.join(rows) if rows else '<tr><td colspan="6" class="muted">Aucun bloc</td></tr>'}
+          {''.join(rows) if rows else '<tr><td colspan="6" class="muted">No blocks</td></tr>'}
         </tbody>
       </table>
     </div>
@@ -2196,14 +2388,14 @@ def explorer_txs():
       <div class="muted">
         <a href="{url_for('explorer')}">← Dashboard</a>
         &nbsp;·&nbsp;
-        <a href="{latest_link}">Dernières</a>
+        <a href="{latest_link}">Latest</a>
         {'&nbsp;·&nbsp;<a href="'+newer_link+'">Plus récentes</a>' if newer_link else ''}
         {'&nbsp;·&nbsp;<a href="'+older_link+'">Plus anciennes</a>' if older_link else ''}
       </div>
 
       <div class="search-row">
         <form action="{url_for('explorer_search')}" method="get" style="display:flex; gap:8px; flex-wrap:wrap; align-items:center;">
-          <input type="text" name="q" placeholder="Recherche: txid / height / adresse..." />
+          <input type="text" name="q" placeholder="Search: txid / height / address..." />
           <button type="submit">Aller</button>
           <span class="pill">Page {page} · {per}/page</span>
         </form>
@@ -2215,13 +2407,13 @@ def explorer_txs():
             <th>TxID</th>
             <th>From</th>
             <th>To</th>
-            <th>Montant</th>
+            <th>Amount</th>
             <th>Timestamp (UTC)</th>
-            <th>Bloc</th>
+            <th>Block</th>
           </tr>
         </thead>
         <tbody>
-          {''.join(tx_rows) if tx_rows else '<tr><td colspan="6" class="muted">Aucune transaction</td></tr>'}
+          {''.join(tx_rows) if tx_rows else '<tr><td colspan="6" class="muted">No transactions</td></tr>'}
         </tbody>
       </table>
     </div>
@@ -2271,13 +2463,13 @@ def explorer_holders():
     content = f"""
     <div class="card">
       <h2>Top Holders</h2>
-      <div class="muted"><a href="{url_for('explorer')}">← Retour</a> · Clique/tap sur une adresse pour copier</div>
+      <div class="muted"><a href="{url_for('explorer')}">← Back</a> · Click/tap an address to copy</div>
       <table>
         <thead>
-          <tr><th>#</th><th>Adresse</th><th>Solde</th><th>% Supply</th></tr>
+          <tr><th>#</th><th>Address</th><th>Balance</th><th>% Supply</th></tr>
         </thead>
         <tbody>
-          {''.join(trs) if trs else '<tr><td colspan="4" class="muted">Aucun holder</td></tr>'}
+          {''.join(trs) if trs else '<tr><td colspan="4" class="muted">No holders</td></tr>'}
         </tbody>
       </table>
     </div>
@@ -2311,14 +2503,14 @@ def explorer_miners():
 
     content = f"""
     <div class="card">
-      <h2>Top Mineurs PoP</h2>
-      <div class="muted"><a href="{url_for('explorer')}">← Retour</a> · Classement par heartbeats on-chain</div>
+      <h2>Top PoP Miners</h2>
+      <div class="muted"><a href="{url_for('explorer')}">← Back</a> · Ranked by on-chain heartbeats</div>
       <table>
         <thead>
-          <tr><th>#</th><th>Adresse</th><th>HB</th><th>Blocs</th></tr>
+          <tr><th>#</th><th>Address</th><th>HB</th><th>Blocks</th></tr>
         </thead>
         <tbody>
-          {''.join(trs) if trs else '<tr><td colspan="4" class="muted">Aucun mineur</td></tr>'}
+          {''.join(trs) if trs else '<tr><td colspan="4" class="muted">No miners</td></tr>'}
         </tbody>
       </table>
     </div>
@@ -2386,13 +2578,13 @@ def explorer_block(height: int):
 
     content = f"""
     <div class="card">
-      <h2>Bloc #{b.index}</h2>
+      <h2>Block #{b.index}</h2>
       <div class="muted">
-        <a href="{url_for('explorer')}">← Retour</a>
+        <a href="{url_for('explorer')}">← Back</a>
         &nbsp;·&nbsp;
-        <a href="{prev_link}">Bloc précédent</a>
+        <a href="{prev_link}">Previous block</a>
         &nbsp;·&nbsp;
-        <a href="{next_link}">Bloc suivant</a>
+        <a href="{next_link}">Next block</a>
       </div>
 
       <div class="kv">
@@ -2404,13 +2596,13 @@ def explorer_block(height: int):
         <div class="k">Difficulty zeros</div><div>{diff_at_block}</div>
         <div class="k">Reward (block)</div><div>{reward_raw / float(SCALE_RAW_PER_PHC):.6f} {TICKER} <span class="muted">({reward_raw} raw)</span></div>
         <div class="k">Reward / mineur</div><div>{per_raw / float(SCALE_RAW_PER_PHC):.6f} {TICKER} <span class="muted">({per_raw} raw)</span></div>
-        <div class="k">Mineurs uniques</div><div>{len(unique_clients)}</div>
+        <div class="k">Unique miners</div><div>{len(unique_clients)}</div>
       </div>
     </div>
 
     <div class="card">
-      <h2>Transactions du bloc</h2>
-      <div class="muted">Affichage des 800 premières max.</div>
+      <h2>Block transactions</h2>
+      <div class="muted">Displaying first 800 entries max.</div>
       <table>
         <thead>
           <tr>
@@ -2418,37 +2610,37 @@ def explorer_block(height: int):
             <th>TxID</th>
             <th>From</th>
             <th>To</th>
-            <th>Montant</th>
+            <th>Amount</th>
             <th>Timestamp</th>
           </tr>
         </thead>
         <tbody>
-          {''.join(tx_rows) if tx_rows else '<tr><td colspan="6" class="muted">Aucune transaction dans ce bloc</td></tr>'}
+          {''.join(tx_rows) if tx_rows else '<tr><td colspan="6" class="muted">No transactions in this block</td></tr>'}
         </tbody>
       </table>
     </div>
 
     <div class="card">
-      <h2>Mineurs du bloc</h2>
-      <div class="muted">Clique/tap sur une adresse pour copier.</div>
+      <h2>Block miners</h2>
+      <div class="muted">Click/tap an address to copy.</div>
       <table>
         <thead>
           <tr>
-            <th>Adresse (pubkey)</th>
-            <th>HB dans ce bloc</th>
-            <th>Reward estimée</th>
+            <th>Address (pubkey)</th>
+            <th>HB in this block</th>
+            <th>Estimated reward</th>
             <th>Reward raw</th>
           </tr>
         </thead>
         <tbody>
-          {''.join(miners_rows) if miners_rows else '<tr><td colspan="4" class="muted">Bloc vide</td></tr>'}
+          {''.join(miners_rows) if miners_rows else '<tr><td colspan="4" class="muted">Empty block</td></tr>'}
         </tbody>
       </table>
     </div>
 
     <div class="card">
-      <h2>Heartbeats du bloc</h2>
-      <div class="muted">Affichage des 800 premiers max.</div>
+      <h2>Block heartbeats</h2>
+      <div class="muted">Displaying first 800 entries max.</div>
       <table>
         <thead>
           <tr>
@@ -2461,7 +2653,7 @@ def explorer_block(height: int):
           </tr>
         </thead>
         <tbody>
-          {''.join(hb_rows) if hb_rows else '<tr><td colspan="6" class="muted">Aucun heartbeat</td></tr>'}
+          {''.join(hb_rows) if hb_rows else '<tr><td colspan="6" class="muted">No heartbeats</td></tr>'}
         </tbody>
       </table>
     </div>
@@ -2484,11 +2676,11 @@ def explorer_tx(txid: str):
     content = f"""
     <div class="card">
       <h2>Transaction</h2>
-      <div class="muted"><a href="{url_for('explorer')}">← Retour</a></div>
+      <div class="muted"><a href="{url_for('explorer')}">← Back</a></div>
 
       <div class="kv">
         <div class="k">TxID</div><div class="phc copyable" onclick="copyText('{tx["txid"]}')">{tx["txid"]}</div>
-        <div class="k">Bloc</div><div><a class="phc" href="{blk_link}">{blk}</a></div>
+        <div class="k">Block</div><div><a class="phc" href="{blk_link}">{blk}</a></div>
         <div class="k">Timestamp</div><div>{fmt_utc(tx["timestamp"])} <span class="muted">(UTC)</span></div>
         <div class="k">From</div><div class="phc copyable" onclick="copyText('{tx["from_pubkey"]}')">{tx["from_pubkey"]}</div>
         <div class="k">To</div><div class="phc copyable" onclick="copyText('{tx["to_pubkey"]}')">{tx["to_pubkey"]}</div>
@@ -2560,15 +2752,15 @@ def explorer_address(address: str):
             f"<td>{age_s}s</td>"
             "</tr>"
         )
-    pending_addr_html = ''.join(pending_rows_addr) if pending_rows_addr else "<tr><td colspan='5' class='muted'>Aucune transaction en attente</td></tr>"
+    pending_addr_html = ''.join(pending_rows_addr) if pending_rows_addr else "<tr><td colspan='5' class='muted'>No pending transactions</td></tr>"
 
     content = f"""
     <div class="card">
-      <h2>Adresse</h2>
+      <h2>Address</h2>
       <div class="phc copyable" onclick="copyText('{address}')">{address}</div>
 
       <div style="margin-top:10px;">
-        <b>Solde</b> : {phc:.6f} {TICKER} <span class="muted">({raw} raw)</span>
+        <b>Balance</b> : {phc:.6f} {TICKER} <span class="muted">({raw} raw)</span>
       </div>
 
       <div style="margin-top:10px;" class="muted">
@@ -2576,16 +2768,16 @@ def explorer_address(address: str):
       </div>
 
       <div style="margin-top:10px;" class="muted">
-        Wallet API (MetaMask-like) : <span class="phc">/address/{address}/state</span>
+        Wallet API (state endpoint) : <span class="phc">/address/{address}/state</span>
       </div>
     </div>
 
     <div class="card">
-      <h2>Transactions en attente (L2)</h2>
-      <div class="muted">Acceptées, mais pas encore dans un bloc.</div>
+      <h2>Pending transactions (L2)</h2>
+      <div class="muted">Accepted, but not yet included in a block.</div>
       <table>
         <thead>
-          <tr><th>TxID</th><th>From</th><th>To</th><th>Montant</th><th>Age</th></tr>
+          <tr><th>TxID</th><th>From</th><th>To</th><th>Amount</th><th>Age</th></tr>
         </thead>
         <tbody>
           {pending_addr_html}
@@ -2594,38 +2786,38 @@ def explorer_address(address: str):
     </div>
 
     <div class="card">
-      <h2>Transactions récentes (on-chain)</h2>
-      <div class="muted">Filtrées sur les dernières TX on-chain.</div>
+      <h2>Recent transactions (on-chain)</h2>
+      <div class="muted">Filtered from the latest on-chain transactions.</div>
       <table>
         <thead>
           <tr>
             <th>TxID</th>
             <th>From</th>
             <th>To</th>
-            <th>Montant</th>
+            <th>Amount</th>
             <th>Timestamp</th>
-            <th>Bloc</th>
+            <th>Block</th>
           </tr>
         </thead>
         <tbody>
-          {''.join(tx_rows) if tx_rows else '<tr><td colspan="6" class="muted">Aucune transaction récente pour cette adresse</td></tr>'}
+          {''.join(tx_rows) if tx_rows else '<tr><td colspan="6" class="muted">No recent transactions for this address</td></tr>'}
         </tbody>
       </table>
     </div>
 
     <div class="card">
-      <h2>Derniers heartbeats (on-chain)</h2>
+      <h2>Latest heartbeats (on-chain)</h2>
       <table>
         <thead>
           <tr>
-            <th>Bloc</th>
+            <th>Block</th>
             <th>Timestamp (UTC)</th>
             <th>Fingerprint</th>
             <th>Latency ms</th>
           </tr>
         </thead>
         <tbody>
-          {''.join(hb_rows) if hb_rows else '<tr><td colspan="4" class="muted">Aucun heartbeat trouvé — il faut attendre un bloc</td></tr>'}
+          {''.join(hb_rows) if hb_rows else '<tr><td colspan="4" class="muted">No heartbeats found — wait for the next block</td></tr>'}
         </tbody>
       </table>
     </div>
@@ -2638,4 +2830,4 @@ def explorer_address(address: str):
 if __name__ == "__main__":
     print(f"Starting {CHAIN_NAME} node...")
     print(f"Ticker: {TICKER} | Consensus: {CONSENSUS_NAME}")
-    app.run(host="0.0.0.0", port=5000, debug=False)
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT","5000")), debug=False)
