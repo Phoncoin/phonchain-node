@@ -1408,6 +1408,18 @@ def submit_proof():
         merged_info.update(device_info_legacy)
         merged_info.update(device_info_v4)
 
+        # --- Server-side gate: block old clients (old APK) ---
+        if os.environ.get("REQUIRE_SCHEMA_V4", "0") == "1":
+            schema = str(merged_info.get("schema", "")).lower().strip()
+            if schema != "v4":
+                return jsonify({"ok": False, "reason": "client_outdated_missing_v4"}), 403
+
+        if os.environ.get("REQUIRE_EMULATOR_SIGNALS", "0") == "1":
+            # New wallet sends emulator_signals (can be empty list)
+            if "emulator_signals" not in merged_info:
+                return jsonify({"ok": False, "reason": "client_outdated_missing_emulator_signals"}), 403
+        # --- End gate ---
+
         latency_ms = -1
         if "latency_ms" in hbj:
             try:
