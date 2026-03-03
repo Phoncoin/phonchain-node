@@ -61,7 +61,7 @@ MAX_BLOCK_HB = int(os.environ.get("MAX_BLOCK_HB", "30000"))  # node default
 
 # TX aggregation
 MIN_BLOCK_TX = int(os.environ.get("MIN_BLOCK_TX", "0"))         # 0 = blocs HB-only OK
-TX_THRESHOLD = int(os.environ.get("TX_THRESHOLD", "200"))         # Comment standardized to Englishation de bloc
+TX_THRESHOLD = int(os.environ.get("TX_THRESHOLD", "200"))         # seuil indicatif (UI/metrics), ne force PAS la création de bloc
 MAX_BLOCK_TX = int(os.environ.get("MAX_BLOCK_TX", "20000"))
 
 # Heartbeat rate limiting
@@ -98,6 +98,7 @@ STRICT_DEVICE_BINDING = int(os.environ.get("STRICT_DEVICE_BINDING", "0"))
 
 # Emulator/Sybil guard toggles (runtime; does NOT change block format)
 EMU_GUARD_ENABLED = int(os.environ.get("EMU_GUARD_ENABLED", "0"))  # 1=reject emulator-like fingerprints
+EMU_GUARD_STRICT_X86 = int(os.environ.get("EMU_GUARD_STRICT_X86", "0"))  # 1=also reject x86 ABI hints
 
 # Persistent fingerprint->pubkey binding (runtime; DB-backed; does NOT change block format)
 # - mode=cooldown: allow rebind after REBIND_COOLDOWN_SEC (default 7 days)
@@ -270,7 +271,7 @@ class PersistDB:
             """
         )
 
-        # Comment standardized to English). We keep it for compatibility.
+        # legacy table (tu l’avais déjà). On la garde.
         c.execute(
             """
             CREATE TABLE IF NOT EXISTS transactions (
@@ -936,6 +937,38 @@ class Node:
     def eval_device_info(self, hb: Heartbeat) -> Dict[str, Any]:
         info = hb.device_info or {}
 
+        # Emulator signals from wallet (hard block when EMU_GUARD is enabled)
+        emulator_signals = info.get("emulator_signals", []) or []
+        if isinstance(emulator_signals, str):
+            emulator_signals = [emulator_signals]
+        if not isinstance(emulator_signals, list):
+            emulator_signals = [str(emulator_signals)]
+        try:
+            emulator_signals = [str(x).strip().lower() for x in emulator_signals if str(x).strip()]
+        except Exception:
+            emulator_signals = []
+
+        if EMU_GUARD_ENABLED == 1:
+            # Strong signal: x86 ABI (Bluestacks/Genymotion/Nox/LDPlayer…)
+            if "abi_x86" in emulator_signals or "abi_x86_64" in emulator_signals:
+                return {"ok": False, "reason": "emulator_abi_x86", "score": 0, "signals": emulator_signals}
+
+            # Any emulator signals reported by the client => reject
+            if len(emulator_signals) > 0:
+                return {"ok": False, "reason": "emulator_signals", "score": 0, "signals": emulator_signals}
+
+            # Optional: strict x86 block using ABI fields if provided
+            if EMU_GUARD_STRICT_X86 == 1:
+                abi = str(info.get("abi", "") or "").lower()
+                abis = info.get("supported_abis", []) or []
+                if isinstance(abis, str):
+                    abis = [abis]
+                if not isinstance(abis, list):
+                    abis = [str(abis)]
+                abis_l = " ".join([abi] + [str(a).lower() for a in abis])
+                if "x86" in abis_l or "x86_64" in abis_l:
+                    return {"ok": False, "reason": "emulator_abi_x86", "score": 0, "signals": ["abi_field"]}
+
         is_emulator = bool(info.get("is_emulator", False))
 
         # Server-side heuristic (prevents trivial client spoofing of is_emulator)
@@ -979,7 +1012,7 @@ class Node:
         elif pi_basic:
             score = max(score, 60)
 
-        # Comment standardized to English
+        # Root sans integrity → plafonné
         if is_rooted and not (pi_basic or pi_device):
             score = min(score, 30)
 
@@ -1260,8 +1293,8 @@ class Node:
                 tx.txid = tx.compute_txid()
 
         # --- IMPORTANT ---
-        # Comment standardized to Englishrifier une TX
-        # Comment standardized to English les TX du bloc (sinon double-compte du pending).
+        # Pendant l'inclusion en bloc, on ne doit PAS vérifier une TX
+        # contre un txpool qui contient déjà les TX du bloc (sinon double-compte du pending).
         # On bascule temporairement le txpool sur rest_tx (mempool restant).
         self.txpool = rest_tx
 
@@ -1404,7 +1437,7 @@ def submit_proof():
     return jsonify({"ok": ok, "reason": reason, "meta": meta})
 
 
-# ✅ State for one address (total / pending / available + pending txs + confirmed txs)
+# ✅ MetaMask-like state for one address (total / pending / available + pending txs + confirmed txs)
 @app.route("/address/<pubkey>/state")
 def address_state(pubkey: str):
     pubkey = (pubkey or "").strip()
@@ -1511,7 +1544,7 @@ def transfer():
 
     ok, reason, meta = node.submit_transaction(tx)
 
-    # Comment standardized to Englishtrocompatible + wallet-friendly (txid + status)
+    # ✅ rétrocompatible + wallet-friendly (txid + status)
     return jsonify(
         {
             "ok": ok,
