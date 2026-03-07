@@ -23,6 +23,8 @@ CHAIN_NAME = "Phonchain"
 TICKER = "PHC"
 CONSENSUS_NAME = "Proof-of-Phone (PoP Secure v4.1)"
 GENESIS_HASH = "c098fa5e985edd56634af262975b771f0dadc607494d6875cb725f1006611658"
+CHAIN_ID = os.environ.get("CHAIN_ID", "phonchain-mainnet")
+TX_VERSION_MAX = 2
 
 # -------------------------------------------------------------------
 # MONETARY POLICY (Bitcoin-like)
@@ -60,8 +62,8 @@ ADAPTIVE_BLOCK_THRESHOLD_MINERS_REF = int(os.environ.get("ADAPTIVE_BLOCK_THRESHO
 MAX_BLOCK_HB = int(os.environ.get("MAX_BLOCK_HB", "30000"))  # node default
 
 # TX aggregation
-MIN_BLOCK_TX = int(os.environ.get("MIN_BLOCK_TX", "0"))         # 0 = blocs HB-only OK
-TX_THRESHOLD = int(os.environ.get("TX_THRESHOLD", "200"))         # seuil indicatif (UI/metrics), ne force PAS la création de bloc
+MIN_BLOCK_TX = int(os.environ.get("MIN_BLOCK_TX", "0"))         # 0 = HB-only blocks OK
+TX_THRESHOLD = int(os.environ.get("TX_THRESHOLD", "200"))         # informational threshold (UI/metrics), does NOT force block creation
 MAX_BLOCK_TX = int(os.environ.get("MAX_BLOCK_TX", "20000"))
 
 # Heartbeat rate limiting
@@ -156,6 +158,9 @@ class Transaction:
     amount: int
     timestamp: int
     signature_hex: str
+    fee: int = 0
+    nonce: Optional[int] = None
+    chain_id: Optional[str] = None
     txid: str = ""  # computed
 
     def compute_txid(self) -> str:
@@ -166,9 +171,11 @@ class Transaction:
             "timestamp": int(self.timestamp),
             "signature": self.signature_hex,
         }
+        if self.nonce is not None:
+            payload["fee"] = int(self.fee)
+            payload["nonce"] = int(self.nonce)
+            payload["chain_id"] = self.chain_id or CHAIN_ID
         return sha256_hex(json.dumps(payload, sort_keys=True).encode())
-
-
 @dataclass
 class Block:
     index: int
@@ -181,8 +188,8 @@ class Block:
     def compute_hash(self) -> str:
         """
         Consensus hash:
-        - inclut heartbeats (champs v3/v4 stables) et transactions (on-chain).
-        - latency_ms n'entre pas dans le hash (hors-consensus).
+        - includes heartbeats (stable v3/v4 fields) and transactions (on-chain).
+        - latency_ms is not part of the hash (out of consensus).
         """
         payload = {
             "index": self.index,
@@ -200,14 +207,20 @@ class Block:
                 for h in self.heartbeats
             ],
             "transactions": [
-                {
+                ({
                     "txid": tx.txid,
                     "from": tx.from_pubkey,
                     "to": tx.to_pubkey,
                     "amount": int(tx.amount),
                     "timestamp": int(tx.timestamp),
                     "signature": tx.signature_hex,
-                }
+                } | (
+                    {
+                        "fee": int(tx.fee),
+                        "nonce": int(tx.nonce),
+                        "chain_id": tx.chain_id or CHAIN_ID,
+                    } if tx.nonce is not None else {}
+                ))
                 for tx in self.transactions
             ],
         }
@@ -271,7 +284,7 @@ class PersistDB:
             """
         )
 
-        # legacy table (tu l’avais déjà). On la garde.
+        # Legacy table (already present). Kept for compatibility.
         c.execute(
             """
             CREATE TABLE IF NOT EXISTS transactions (
@@ -303,9 +316,32 @@ class PersistDB:
 
         c.execute("CREATE INDEX IF NOT EXISTS idx_txs_block ON txs(block_idx);")
         c.execute("CREATE INDEX IF NOT EXISTS idx_txs_from_to ON txs(from_pubkey, to_pubkey);")
+        # Transaction V2 soft-migration (legacy-safe)
+        try:
+            c.execute("ALTER TABLE txs ADD COLUMN fee_raw INTEGER DEFAULT 0;")
+        except Exception:
+            pass
+        try:
+            c.execute("ALTER TABLE txs ADD COLUMN nonce INTEGER;")
+        except Exception:
+            pass
+        try:
+            c.execute("ALTER TABLE txs ADD COLUMN chain_id TEXT;")
+        except Exception:
+            pass
+        c.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_txs_sender_nonce ON txs(from_pubkey, nonce) WHERE nonce IS NOT NULL;")
+
+        c.execute(
+            """
+            CREATE TABLE IF NOT EXISTS account_nonces (
+                pubkey TEXT PRIMARY KEY,
+                next_nonce INTEGER NOT NULL DEFAULT 0
+            );
+            """
+        )
 
 
-        # Persistent device fingerprint bindings (anti-sybil, restart-safe; hors-consensus)
+        # Persistent device fingerprint bindings (anti-sybil, restart-safe; out of consensus)
         c.execute(
             """
             CREATE TABLE IF NOT EXISTS device_bindings (
@@ -319,7 +355,7 @@ class PersistDB:
         )
         c.execute("CREATE INDEX IF NOT EXISTS idx_device_bindings_pubkey ON device_bindings(pubkey);")
 
-        # meta table (hors-consensus) pour metrics explorer
+        # Meta table (out of consensus) for explorer metrics
         c.execute(
             """
             CREATE TABLE IF NOT EXISTS block_meta (
@@ -379,9 +415,9 @@ class PersistDB:
                 """
                 INSERT OR REPLACE INTO txs(
                     txid, block_idx, idx_in_block,
-                    from_pubkey, to_pubkey, amount_raw, timestamp, signature
+                    from_pubkey, to_pubkey, amount_raw, timestamp, signature, fee_raw, nonce, chain_id
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?);
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
                 """,
                 (
                     tx.txid,
@@ -392,6 +428,9 @@ class PersistDB:
                     int(tx.amount),
                     int(tx.timestamp),
                     tx.signature_hex,
+                    int(tx.fee),
+                    int(tx.nonce) if tx.nonce is not None else None,
+                    tx.chain_id or None,
                 ),
             )
 
@@ -485,6 +524,9 @@ class PersistDB:
                         amount=int(t["amount_raw"]),
                         timestamp=int(t["timestamp"]),
                         signature_hex=t["signature"],
+                        fee=int(t["fee_raw"]) if "fee_raw" in t.keys() and t["fee_raw"] is not None else 0,
+                        nonce=int(t["nonce"]) if "nonce" in t.keys() and t["nonce"] is not None else None,
+                        chain_id=t["chain_id"] if "chain_id" in t.keys() and t["chain_id"] is not None else None,
                         txid=t["txid"],
                     )
                 )
@@ -515,8 +557,25 @@ class PersistDB:
         rows = c.execute("SELECT * FROM balances;").fetchall()
         return {r["pubkey"]: int(r["balance_raw"]) for r in rows}
 
+    def get_next_nonce(self, pubkey: str) -> int:
+        c = self.conn.cursor()
+        r = c.execute("SELECT next_nonce FROM account_nonces WHERE pubkey = ?;", (pubkey,)).fetchone()
+        if not r:
+            return 0
+        try:
+            return int(r["next_nonce"])
+        except Exception:
+            return int(r[0])
+
+    def set_next_nonce(self, pubkey: str, next_nonce: int) -> None:
+        c = self.conn.cursor()
+        c.execute(
+            "INSERT OR REPLACE INTO account_nonces(pubkey, next_nonce) VALUES (?, ?);",
+            (pubkey, int(next_nonce)),
+        )
+        self.conn.commit()
     # ---------------------------------------------------------------
-    # Persistent device fingerprint bindings (anti-sybil; hors-consensus)
+    # Persistent device fingerprint bindings (anti-sybil; out of consensus)
     # ---------------------------------------------------------------
     def load_device_bindings(self) -> Dict[str, Dict[str, Any]]:
         c = self.conn.cursor()
@@ -596,6 +655,9 @@ class PersistDB:
             "amount_raw": int(r["amount_raw"]),
             "timestamp": int(r["timestamp"]),
             "signature": r["signature"],
+            "fee_raw": int(r["fee_raw"]) if "fee_raw" in r.keys() and r["fee_raw"] is not None else 0,
+            "nonce": int(r["nonce"]) if "nonce" in r.keys() and r["nonce"] is not None else None,
+            "chain_id": r["chain_id"] if "chain_id" in r.keys() and r["chain_id"] is not None else None,
         }
 
     def load_recent_txs(self, limit: int = 50) -> List[Dict[str, Any]]:
@@ -615,6 +677,9 @@ class PersistDB:
                     "to_pubkey": r["to_pubkey"],
                     "amount_raw": int(r["amount_raw"]),
                     "timestamp": int(r["timestamp"]),
+                    "fee_raw": int(r["fee_raw"]) if "fee_raw" in r.keys() and r["fee_raw"] is not None else 0,
+                    "nonce": int(r["nonce"]) if "nonce" in r.keys() and r["nonce"] is not None else None,
+                    "chain_id": r["chain_id"] if "chain_id" in r.keys() and r["chain_id"] is not None else None,
                 }
             )
         return out
@@ -647,6 +712,9 @@ class PersistDB:
                     "to_pubkey": r["to_pubkey"],
                     "amount_raw": int(r["amount_raw"]),
                     "timestamp": int(r["timestamp"]),
+                    "fee_raw": int(r["fee_raw"]) if "fee_raw" in r.keys() and r["fee_raw"] is not None else 0,
+                    "nonce": int(r["nonce"]) if "nonce" in r.keys() and r["nonce"] is not None else None,
+                    "chain_id": r["chain_id"] if "chain_id" in r.keys() and r["chain_id"] is not None else None,
                 }
             )
         return out
@@ -674,6 +742,9 @@ class PersistDB:
                     "to_pubkey": r["to_pubkey"],
                     "amount_raw": int(r["amount_raw"]),
                     "timestamp": int(r["timestamp"]),
+                    "fee_raw": int(r["fee_raw"]) if "fee_raw" in r.keys() and r["fee_raw"] is not None else 0,
+                    "nonce": int(r["nonce"]) if "nonce" in r.keys() and r["nonce"] is not None else None,
+                    "chain_id": r["chain_id"] if "chain_id" in r.keys() and r["chain_id"] is not None else None,
                 }
             )
         return out
@@ -730,7 +801,7 @@ class Node:
         self.device_last_seen: Dict[str, int] = {}
         self.device_bindings: Dict[str, str] = {}
 
-        # Persistent binding meta (restart-safe anti-sybil; hors-consensus)
+        # Persistent binding metadata (restart-safe anti-sybil; out of consensus)
         self.device_bindings_meta: Dict[str, Dict[str, Any]] = {}
 
         if PERSIST_BINDING_ENABLED == 1:
@@ -753,6 +824,7 @@ class Node:
 
         # TX sender rate-limit tracking
         self.tx_last_seen: Dict[str, int] = {}
+        self.next_nonces: Dict[str, int] = {}
 
         self.total_issued_raw: int = sum(self.balances.values())
         self.difficulty_zeros: int = INITIAL_DIFFICULTY_ZEROS
@@ -1012,7 +1084,7 @@ class Node:
         elif pi_basic:
             score = max(score, 60)
 
-        # Root sans integrity → plafonné
+        # Root without integrity -> capped
         if is_rooted and not (pi_basic or pi_device):
             score = min(score, 30)
 
@@ -1074,20 +1146,19 @@ class Node:
         except Exception:
             return False, "bad_signature", {}
 
-        # rate limit (pubkey)
+        # rate limit (server-time based)
+        # We still verify freshness with the signed client timestamp above,
+        # but cadence must rely on server time, not client-supplied time.
         last_ts_addr = self.clients_seen.get(hb.pubkey_hex)
-        if last_ts_addr is not None:
-            if hb.timestamp <= last_ts_addr:
-                return False, "replay_or_non_increasing_timestamp", {}
-            if hb.timestamp - last_ts_addr < MIN_SECONDS_BETWEEN_HB_PER_PUBKEY:
-                return False, "rate_limited_pubkey", {"min_seconds": MIN_SECONDS_BETWEEN_HB_PER_PUBKEY}
-        self.clients_seen[hb.pubkey_hex] = hb.timestamp
+        if last_ts_addr is not None and (now - int(last_ts_addr)) < MIN_SECONDS_BETWEEN_HB_PER_PUBKEY:
+            return False, "rate_limited_pubkey", {"min_seconds": MIN_SECONDS_BETWEEN_HB_PER_PUBKEY}
+        self.clients_seen[hb.pubkey_hex] = now
 
-        # rate limit (device)
+        # rate limit (device, server-time based)
         last_ts_dev = self.device_last_seen.get(hb.device_fingerprint)
-        if last_ts_dev is not None and (hb.timestamp - last_ts_dev) < MIN_SECONDS_BETWEEN_HB_PER_DEVICE:
+        if last_ts_dev is not None and (now - int(last_ts_dev)) < MIN_SECONDS_BETWEEN_HB_PER_DEVICE:
             return False, "rate_limited_device", {"min_seconds": MIN_SECONDS_BETWEEN_HB_PER_DEVICE}
-        self.device_last_seen[hb.device_fingerprint] = hb.timestamp
+        self.device_last_seen[hb.device_fingerprint] = now
 
 
         # bind (in-memory) + optional persistent binding (DB)
@@ -1184,10 +1255,35 @@ class Node:
         s = 0
         for tx in self.txpool:
             if tx.from_pubkey == from_pubkey:
-                s += int(tx.amount)
+                s += int(tx.amount) + int(getattr(tx, "fee", 0) or 0)
         return s
 
-    def verify_transaction(self, tx: Transaction) -> Tuple[bool, str]:
+    def get_next_nonce(self, pubkey: str) -> int:
+        if pubkey in self.next_nonces:
+            return int(self.next_nonces[pubkey])
+        n = int(self.db.get_next_nonce(pubkey))
+        self.next_nonces[pubkey] = n
+        return n
+
+    def set_next_nonce(self, pubkey: str, next_nonce: int) -> None:
+        self.next_nonces[pubkey] = int(next_nonce)
+        self.db.set_next_nonce(pubkey, int(next_nonce))
+
+    def _verify_tx_signature(self, tx: Transaction) -> bool:
+        try:
+            pk = Ed25519PublicKey.from_public_bytes(bytes.fromhex(tx.from_pubkey))
+            if tx.nonce is not None:
+                cid = (tx.chain_id or "").strip()
+                if not cid:
+                    return False
+                payload = f"{cid}|{tx.from_pubkey}|{tx.to_pubkey}|{int(tx.amount)}|{int(tx.fee)}|{int(tx.nonce)}|{int(tx.timestamp)}".encode()
+            else:
+                payload = (tx.from_pubkey + tx.to_pubkey + str(int(tx.amount)) + str(int(tx.timestamp))).encode()
+            pk.verify(bytes.fromhex(tx.signature_hex), payload)
+            return True
+        except Exception:
+            return False
+    def verify_transaction(self, tx: Transaction, *, skip_rate_limit: bool = False) -> Tuple[bool, str]:
         now = int(time.time())
 
         # TX age guard (prevents very old replays flooding mempool)
@@ -1195,43 +1291,61 @@ class Node:
             return False, "tx_too_old"
 
         # Sender rate limit (applied before heavy checks)
-        # Use server time to prevent bypass via forged client timestamps.
-        last = self.tx_last_seen.get(tx.from_pubkey)
-        if last is not None and (now - int(last)) < MIN_SECONDS_BETWEEN_TX_PER_PUBKEY:
-            return False, "rate_limited_tx"
+        if not skip_rate_limit:
+            last = self.tx_last_seen.get(tx.from_pubkey)
+            if last is not None and (now - int(last)) < MIN_SECONDS_BETWEEN_TX_PER_PUBKEY:
+                return False, "rate_limited_tx"
 
         if tx.amount <= 0:
             return False, "amount_invalid"
 
+        if tx.fee < 0:
+            return False, "fee_invalid"
+
         if tx.from_pubkey == tx.to_pubkey:
             return False, "self_transfer_not_allowed"
+
+        if tx.nonce is not None:
+            tx.chain_id = (tx.chain_id or CHAIN_ID).strip()
+            if tx.chain_id != CHAIN_ID:
+                return False, "wrong_chain_id"
+
+            expected_nonce = self.get_next_nonce(tx.from_pubkey)
+            pending_nonces = {int(t.nonce) for t in self.txpool if t.from_pubkey == tx.from_pubkey and t.nonce is not None}
+            while expected_nonce in pending_nonces:
+                expected_nonce += 1
+            if int(tx.nonce) != int(expected_nonce):
+                return False, "bad_nonce"
 
         balance_raw = self.balances.get(tx.from_pubkey, 0)
         pending = self.pending_outgoing_raw(tx.from_pubkey)
         available = balance_raw - pending
-        if available < tx.amount:
+        required = int(tx.amount) + int(getattr(tx, "fee", 0) or 0)
+        if available < required:
             return False, "insufficient_funds"
 
-        try:
-            pk = Ed25519PublicKey.from_public_bytes(bytes.fromhex(tx.from_pubkey))
-            payload = (tx.from_pubkey + tx.to_pubkey + str(int(tx.amount)) + str(int(tx.timestamp))).encode()
-            pk.verify(bytes.fromhex(tx.signature_hex), payload)
-        except Exception:
+        if not self._verify_tx_signature(tx):
             return False, "bad_signature"
 
         if not tx.txid:
             tx.txid = tx.compute_txid()
 
+        if self.db.load_tx_by_txid(tx.txid) is not None:
+            return False, "tx_already_confirmed"
+
         return True, "ok"
 
     def submit_transaction(self, tx: Transaction) -> Tuple[bool, str, Dict[str, Any]]:
         with self.lock:
-            ok, reason = self.verify_transaction(tx)
+            ok, reason = self.verify_transaction(tx, skip_rate_limit=True)
             if not ok:
                 return False, reason, {}
 
             if any(t.txid == tx.txid for t in self.txpool):
                 return False, "tx_already_in_mempool", {"txid": tx.txid}
+
+            if tx.nonce is not None and any(t.from_pubkey == tx.from_pubkey and t.nonce == tx.nonce for t in self.txpool):
+                return False, "sender_nonce_already_pending", {"txid": tx.txid, "nonce": int(tx.nonce)}
 
             # TX pool caps (anti-spam)
             if len(self.txpool) >= MAX_TXPOOL:
@@ -1256,11 +1370,15 @@ class Node:
         self.balances.setdefault(tx.from_pubkey, 0)
         self.balances.setdefault(tx.to_pubkey, 0)
 
-        self.balances[tx.from_pubkey] -= int(tx.amount)
+        total_debit = int(tx.amount) + int(getattr(tx, "fee", 0) or 0)
+        self.balances[tx.from_pubkey] -= total_debit
         self.balances[tx.to_pubkey] += int(tx.amount)
 
         self.db.save_balance(tx.from_pubkey, self.balances[tx.from_pubkey])
         self.db.save_balance(tx.to_pubkey, self.balances[tx.to_pubkey])
+
+        if tx.nonce is not None:
+            self.set_next_nonce(tx.from_pubkey, int(tx.nonce) + 1)
 
     # ------------------ BLOCK CREATION ------------------
 
@@ -1293,15 +1411,15 @@ class Node:
                 tx.txid = tx.compute_txid()
 
         # --- IMPORTANT ---
-        # Pendant l'inclusion en bloc, on ne doit PAS vérifier une TX
-        # contre un txpool qui contient déjà les TX du bloc (sinon double-compte du pending).
-        # On bascule temporairement le txpool sur rest_tx (mempool restant).
+        # During block inclusion we must NOT verify a transaction
+        # against a txpool that already contains the block transactions (otherwise pending would be double-counted).
+        # We temporarily switch txpool to rest_tx (remaining mempool).
         self.txpool = rest_tx
 
-        # applique tx (si verify fail -> drop du bloc)
+        # Apply transactions (if verification fails -> drop from block)
         applied = []
         for tx in blk.transactions:
-            ok, reason = self.verify_transaction(tx)
+            ok, reason = self.verify_transaction(tx, skip_rate_limit=True)
             if not ok:
                 print(f"[TX] dropped_in_block txid={getattr(tx,'txid',None)} reason={reason}")
                 continue
@@ -1449,7 +1567,7 @@ def submit_proof():
     return jsonify({"ok": ok, "reason": reason, "meta": meta})
 
 
-# ✅ MetaMask-like state for one address (total / pending / available + pending txs + confirmed txs)
+# ✅ State for one address (total / pending / available + pending txs + confirmed txs)
 @app.route("/address/<pubkey>/state")
 def address_state(pubkey: str):
     pubkey = (pubkey or "").strip()
@@ -1485,6 +1603,9 @@ def address_state(pubkey: str):
             "balance": {"raw": balance_raw, "phc": balance_raw / float(SCALE_RAW_PER_PHC)},
             "pending_outgoing": {"raw": pending_raw, "phc": pending_raw / float(SCALE_RAW_PER_PHC)},
             "available": {"raw": available_raw, "phc": available_raw / float(SCALE_RAW_PER_PHC)},
+            "next_nonce": node.get_next_nonce(pubkey),
+            "chain_id": CHAIN_ID,
+            "tx_version_max": TX_VERSION_MAX,
             "pending_txs": pending_txs[-80:],
             "recent_txs": confirmed,
         }
@@ -1515,6 +1636,9 @@ def address_transactions(pubkey: str):
                         "from_pubkey": tx.from_pubkey,
                         "to_pubkey": tx.to_pubkey,
                         "amount": {"raw": int(tx.amount), "phc": int(tx.amount) / float(SCALE_RAW_PER_PHC)},
+                        "fee_raw": int(getattr(tx, "fee", 0) or 0),
+                        "nonce": int(tx.nonce) if tx.nonce is not None else None,
+                        "chain_id": tx.chain_id,
                         "timestamp": int(tx.timestamp),
                         "status": "pending",
                         "layer": "L2",
@@ -1548,15 +1672,19 @@ def transfer():
         amount_raw = int(j["amount"])
         ts = int(j["timestamp"])
         sig = j["signature"]
+        fee_raw = int(j.get("fee", 0) or 0)
+        nonce = j.get("nonce", None)
+        nonce = int(nonce) if nonce is not None else None
+        chain_id = j.get("chain_id", None)
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 400
 
-    tx = Transaction(from_pubkey=from_pk, to_pubkey=to_pk, amount=amount_raw, timestamp=ts, signature_hex=sig)
+    tx = Transaction(from_pubkey=from_pk, to_pubkey=to_pk, amount=amount_raw, timestamp=ts, signature_hex=sig, fee=fee_raw, nonce=nonce, chain_id=chain_id)
     tx.txid = tx.compute_txid()
 
     ok, reason, meta = node.submit_transaction(tx)
 
-    # ✅ rétrocompatible + wallet-friendly (txid + status)
+    # Backward-compatible and wallet-friendly response (txid + status)
     return jsonify(
         {
             "ok": ok,
@@ -1628,6 +1756,9 @@ def tx_status(txid: str):
                             "from_pubkey": t.from_pubkey,
                             "to_pubkey": t.to_pubkey,
                             "amount_raw": int(t.amount),
+                            "fee_raw": int(getattr(t, "fee", 0) or 0),
+                            "nonce": int(t.nonce) if t.nonce is not None else None,
+                            "chain_id": t.chain_id,
                             "timestamp": int(t.timestamp),
                         },
                     }
@@ -1740,6 +1871,8 @@ def network_info():
             "ticker": TICKER,
             "consensus": CONSENSUS_NAME,
             "genesis_hash": GENESIS_HASH,
+            "chain_id": CHAIN_ID,
+            "tx_version_max": TX_VERSION_MAX,
             "height": height,
             "total_issued": {"phc": total_phc, "raw": node.total_issued_raw},
             "total_supply_cap": {"phc": total_cap_phc, "raw": TOTAL_SUPPLY_CAP_RAW},
@@ -2023,7 +2156,7 @@ def explorer():
 
       <div class="metrics">
         <div class="metric-box">
-          <div class="muted">Holders (solde &gt; 0)</div>
+          <div class="muted">Holders (balance &gt; 0)</div>
           <div style="font-size:22px; font-weight:700; color:#a7ffdf;">{holders}</div>
         </div>
         <div class="metric-box">
@@ -2358,14 +2491,14 @@ def explorer_blocks():
         <a href="{url_for('explorer')}">← Dashboard</a>
         &nbsp;·&nbsp;
         <a href="{latest_link}">Latest</a>
-        {'&nbsp;·&nbsp;<a href="'+newer_link+'">Plus récents</a>' if newer_link else ''}
-        {'&nbsp;·&nbsp;<a href="'+older_link+'">Plus anciens</a>' if older_link else ''}
+        {'&nbsp;·&nbsp;<a href="'+newer_link+'">Newer</a>' if newer_link else ''}
+        {'&nbsp;·&nbsp;<a href="'+older_link+'">Older</a>' if older_link else ''}
       </div>
 
       <div class="search-row">
         <form action="{url_for('explorer_search')}" method="get" style="display:flex; gap:8px; flex-wrap:wrap; align-items:center;">
-          <input type="text" name="q" placeholder="Jump: height / hash / txid / adresse..." />
-          <button type="submit">Aller</button>
+          <input type="text" name="q" placeholder="Jump: height / hash / txid / address..." />
+          <button type="submit">Go</button>
           <span class="pill">Page {page} · {per}/page · Height {height}</span>
         </form>
       </div>
@@ -2434,14 +2567,14 @@ def explorer_txs():
         <a href="{url_for('explorer')}">← Dashboard</a>
         &nbsp;·&nbsp;
         <a href="{latest_link}">Latest</a>
-        {'&nbsp;·&nbsp;<a href="'+newer_link+'">Plus récentes</a>' if newer_link else ''}
+        {'&nbsp;·&nbsp;<a href="'+newer_link+'">Newer</a>' if newer_link else ''}
         {'&nbsp;·&nbsp;<a href="'+older_link+'">Plus anciennes</a>' if older_link else ''}
       </div>
 
       <div class="search-row">
         <form action="{url_for('explorer_search')}" method="get" style="display:flex; gap:8px; flex-wrap:wrap; align-items:center;">
           <input type="text" name="q" placeholder="Search: txid / height / address..." />
-          <button type="submit">Aller</button>
+          <button type="submit">Go</button>
           <span class="pill">Page {page} · {per}/page</span>
         </form>
       </div>
@@ -2640,7 +2773,7 @@ def explorer_block(height: int):
         <div class="k">Transactions</div><div>{len(b.transactions)}</div>
         <div class="k">Difficulty zeros</div><div>{diff_at_block}</div>
         <div class="k">Reward (block)</div><div>{reward_raw / float(SCALE_RAW_PER_PHC):.6f} {TICKER} <span class="muted">({reward_raw} raw)</span></div>
-        <div class="k">Reward / mineur</div><div>{per_raw / float(SCALE_RAW_PER_PHC):.6f} {TICKER} <span class="muted">({per_raw} raw)</span></div>
+        <div class="k">Reward / miner</div><div>{per_raw / float(SCALE_RAW_PER_PHC):.6f} {TICKER} <span class="muted">({per_raw} raw)</span></div>
         <div class="k">Unique miners</div><div>{len(unique_clients)}</div>
       </div>
     </div>
@@ -2809,7 +2942,7 @@ def explorer_address(address: str):
       </div>
 
       <div style="margin-top:10px;" class="muted">
-        Lien direct : <span class="phc">/explorer/address/{address}</span>
+        Direct link: <span class="phc">/explorer/address/{address}</span>
       </div>
 
       <div style="margin-top:10px;" class="muted">
